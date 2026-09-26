@@ -1,0 +1,1091 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fairy Delivery</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #fbf6f4; }
+  body {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    font-family: 'Press Start 2P', monospace;
+  }
+  #wrap { width: min(960px, calc(100vw - 32px)); }
+  canvas {
+    width: 100%; height: auto; display: block;
+    image-rendering: pixelated; border-radius: 14px;
+    box-shadow: 0 10px 40px rgba(140, 110, 180, 0.18);
+  }
+  p { color: #b3a4c7; font-size: 10px; text-align: center; margin-top: 18px; line-height: 1.8; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game"></canvas>
+  <p>SPACE is the only key &middot; tap to choose &middot; hold to select</p>
+</div>
+<script>
+'use strict';
+
+// ============================================================
+// 1. Config
+// ============================================================
+const W = 800, H = 260, R = 2;            // logical size, backing-store ratio
+const GROUND_Y = 212;
+const FAIRY_X = 70;
+const SPEED = 380;                          // px/s, constant (no ramp)
+const GRAVITY = 2800;
+const JUMP_V = 560;                         // dino-style initial velocity
+const HOLD_GRAVITY_MULT = 0.3;              // lighter gravity while holding (dino)
+const HOLD_MAX = 0.2;                       // max seconds of hold boost
+const FLUTTER_V = 500;                      // double-jump mid-air boost
+const JUMP_BUFFER = 0.12;
+const HOLD_TIME = 0.6;                      // menu: hold this long to select
+const MIN_GAP = 320, MAX_GAP = 720;
+const SHORT = new URLSearchParams(location.search).has('short');
+const LEVEL_DIST = SHORT ? 2400 : 14000;    // ~37 s per level
+const SCORE_DIV = 40;
+const VILLAGE_X = 300;                      // where the village stops on screen
+const UI = '#6b5b8a', UI_SOFT = '#9d8fb8', UI_ACCENT = '#f5bcd6', UI_STROKE = '#d99cc3';
+const SPARK = ['#fff3a8', '#ffd0e6', '#c8efff', '#e2d4ff'];
+
+const canvas = document.getElementById('game');
+canvas.width = W * R; canvas.height = H * R;
+const ctx = canvas.getContext('2d');
+ctx.scale(R, R);
+ctx.imageSmoothingEnabled = false;
+
+// ============================================================
+// 2. Sprites
+// ============================================================
+function makeSprite(rows, pal, scale, flip) {
+  const h = rows.length, w = rows[0].length;
+  if (rows.some(r => r.length !== w)) console.warn('Uneven sprite rows', rows);
+  const c = document.createElement('canvas');
+  c.width = w * scale * R; c.height = h * scale * R;
+  const g = c.getContext('2d');
+  rows.forEach((row, y) => {
+    for (let x = 0; x < w; x++) {
+      const col = pal[row[flip ? w - 1 - x : x]];
+      if (!col) continue;
+      g.fillStyle = col;
+      g.fillRect(x * scale * R, y * scale * R, scale * R, scale * R);
+    }
+  });
+  return { c, w: w * scale, h: h * scale };
+}
+function draw(s, x, y, w, h) {
+  ctx.drawImage(s.c, Math.round(x), Math.round(y), w ?? s.w, h ?? s.h);
+}
+
+const FAIRY_PAL = { h: '#ffc86b', s: '#ffe3d1', e: '#5d4a78', d: '#f59fc4', w: 'rgba(196,236,255,0.92)', k: '#9a7cc9' };
+const FAIRY = [
+  makeSprite([
+    '.ww....hhh...',
+    'wwww..hhhhh..',
+    'wwwww.hhsss..',
+    '.wwwwwhsess..',
+    '..wwwwhssss..',
+    '...wwwwhss...',
+    '....wwddd....',
+    '.....ddddds..',
+    '....dddddd...',
+    '....dddddd...',
+    '...dddddddd..',
+    '...dddddddd..',
+    '.....s..s....',
+    '.....k..k....',
+  ], FAIRY_PAL, 3),
+  makeSprite([
+    '.......hhh...',
+    '......hhhhh..',
+    '......hhsss..',
+    '......hsess..',
+    '......hssss..',
+    '.......hss...',
+    '..wwwwddd....',
+    'wwwwwddddds..',
+    '.wwwdddddd...',
+    '..w.dddddd...',
+    '...dddddddd..',
+    '...dddddddd..',
+    '.....s..s....',
+    '.....k..k....',
+  ], FAIRY_PAL, 3),
+];
+const FH = FAIRY[0].h;
+
+const ITEM_ROWS = {
+  acorn: [
+    '..c...',
+    '.cccc.',
+    'cccccc',
+    '.nlnn.',
+    '.nnnn.',
+    '..nn..',
+  ],
+  honey: [
+    '.llll.',
+    '.rrrr.',
+    'yyyyyy',
+    'yhyyyy',
+    'yyyyyy',
+    '.yyyy.',
+  ],
+  moon: [
+    '..mm..',
+    '.mwmm.',
+    'mmmmnm',
+    'mmmnnm',
+    '.mmmm.',
+    '..mm..',
+  ],
+};
+const ITEM_PAL = {
+  acorn: { c: '#9c6b4a', n: '#e0a86f', l: '#f6cf9f' },
+  honey: { l: '#b5845a', r: '#f28b82', y: '#ffc94d', h: '#fff0b3' },
+  moon:  { m: '#b9e6ff', w: '#ffffff', n: '#94c4f0' },
+};
+function itemSprites(key) {
+  return { hand: makeSprite(ITEM_ROWS[key], ITEM_PAL[key], 2), big: makeSprite(ITEM_ROWS[key], ITEM_PAL[key], 3) };
+}
+
+const HOUSE_ROWS = [
+  '....cccccc....',
+  '..cccwccccccc.',
+  '.cccccccccwccc',
+  'cccwcccccccccc',
+  'cccccccccccccc',
+  '..ssssssssss..',
+  '..sbbsssssss..',
+  '..sbbssssdds..',
+  '..sssssssdds..',
+  '..sssssssdds..',
+  '..sssssssdds..',
+];
+const housePal = cap => ({ c: cap, w: '#fff6ee', s: '#fff1e2', b: '#bfe3ff', d: '#c09070' });
+const HOUSE_BIG = makeSprite(HOUSE_ROWS, housePal('#f59a9a'), 4);
+const HOUSE_S1 = makeSprite(HOUSE_ROWS, housePal('#c3a6f2'), 3);
+const HOUSE_S2 = makeSprite(HOUSE_ROWS, housePal('#8fd6b4'), 3);
+const HOUSE_TINY = makeSprite(HOUSE_ROWS, housePal('#f59a9a'), 1);
+
+const CLOUD_ROWS = [
+  '....wwww......',
+  '..wwwwwwww....',
+  '.wwwwwwwwwwww.',
+  'wwwwwwwwwwwwww',
+];
+const CLOUD = makeSprite(CLOUD_ROWS, { w: '#ffffff' }, 3);
+
+function ob(name, rows, pal, scale, group, flip) {
+  return { name, spr: makeSprite(rows, pal, scale, flip), scale, group };
+}
+
+// ============================================================
+// 3. Levels
+// ============================================================
+const LEVELS = [
+  {
+    name: 'Mossy Meadow', item: 'Acorn', items: itemSprites('acorn'),
+    sky: ['#fde7da', '#e4f6ec'], hill: '#d3eedd', ground: '#86bfa0', fill: '#eef8f1', speck: '#a9d3bc', hud: '#6f9a83',
+    decor: { clouds: true },
+    obs: [
+      ob('a mushroom', [
+        '..rrrr..',
+        '.rrwrrr.',
+        'rrrrrrwr',
+        'rwrrrrrr',
+        '..ssss..',
+        '...ss...',
+        '...ss...',
+        '...ss...',
+        '..ssss..',
+      ], { r: '#f28b82', w: '#fff4ec', s: '#f6e3cf' }, 3, 2),
+      ob('some pebbles', [
+        '...pppq...',
+        '..ppppppq.',
+        '.pqppppppp',
+        'pppppqpppp',
+        'pppppppppp',
+      ], { p: '#c9c1c9', q: '#ece6ea' }, 3, 2),
+      ob('the tall grass', [
+        '...h...',
+        '...g..h',
+        'h..g..g',
+        'g..g..g',
+        'g..g.g.',
+        'g.gg.g.',
+        '.gg..g.',
+        '.g.g.g.',
+        '.g.ggg.',
+        '.g.gg..',
+        '..ggg.g',
+        'g.gg.gg',
+        'gggg.g.',
+        '.ggggg.',
+        '.gggg..',
+        '..ggg..',
+      ], { g: '#8fcf9e', h: '#ffc3a0' }, 4, 1),
+    ],
+  },
+  {
+    name: 'Honey Garden', item: 'Honey Jar', items: itemSprites('honey'),
+    sky: ['#fff4c9', '#efe5fb'], hill: '#eadcf6', ground: '#b89fd8', fill: '#faf4e3', speck: '#d4c3ea', hud: '#8a74b0',
+    decor: { clouds: true, petals: true, sun: true },
+    obs: [
+      ob('a thistle', [
+        '..p.p..',
+        '.ppppp.',
+        'p.ppp.p',
+        '.ppppp.',
+        '..ggg..',
+        '...g...',
+        '.g.g.g.',
+        '..ggg..',
+        '...g...',
+        'g..g..g',
+        '.g.g.g.',
+        '..ggg..',
+      ], { p: '#b58be0', g: '#8ec79a' }, 3, 1),
+      ob('a snail', [
+        '...ssss..e',
+        '..sshhss.b',
+        '.sshsshs.b',
+        '.shssshsbb',
+        '.sshhhssbb',
+        'bbbbbbbbbb',
+      ], { s: '#f3c677', h: '#d99a4e', b: '#c7e3b5', e: '#6b5a7a' }, 3, 1, true),
+      ob('the flowers', [
+        '.fff.....',
+        'ffcff....',
+        '.fff.aaa.',
+        '..g.aacaa',
+        '..g..aaa.',
+        '..g...g..',
+        '.gg...g..',
+        '..g..gg..',
+        '..g...g..',
+        '..g...g..',
+        '..gg..g..',
+        '..g..gg..',
+        '..g...g..',
+        '.ggg.ggg.',
+        'ggggggggg',
+        '.ggggggg.',
+      ], { f: '#ff9fc6', c: '#fff1a8', a: '#b8a6ff', g: '#8ec79a' }, 4, 1),
+    ],
+  },
+  {
+    name: 'Twilight Glade', item: 'Moonstone', items: itemSprites('moon'),
+    sky: ['#a39ddb', '#e6d7f4'], hill: '#c4b8ea', ground: '#7d77bd', fill: '#dcd2f2', speck: '#aaa2dd', hud: '#ffffff',
+    decor: { stars: true, moon: true, fireflies: true },
+    obs: [
+      ob('a thorny rose', [
+        '..rrr...',
+        '.rrqrr..',
+        '.rqrrr..',
+        '..rrr...',
+        '...g....',
+        '...gt...',
+        '..tg....',
+        '...g....',
+        '...gl...',
+        '...gll..',
+        '..tg....',
+        '...gt...',
+        '...g....',
+        '..lg....',
+        '.llg....',
+        '..ggg...',
+      ], { r: '#ff8fb1', q: '#ffd0de', g: '#6fae9a', t: '#eef4ff', l: '#8fd1b5' }, 4, 1),
+      ob('a frog', [
+        '.gg....gg.',
+        'gwkg..gwkg',
+        'gggggggggg',
+        'ggddddddgg',
+        '.gllllllg.',
+        'gg.gggg.gg',
+        'gg......gg',
+      ], { g: '#9fd89a', w: '#ffffff', k: '#4a3f66', d: '#5f9c6a', l: '#e8f7c8' }, 3, 1),
+      ob('the crystals', [
+        '....c.....',
+        '...cw..c..',
+        '...cc.cw..',
+        '.c.cwccc..',
+        'cw.cccwc.c',
+        'ccccwcccwc',
+        'cccccccccc',
+        'dddddddddd',
+      ], { c: '#a8e6ff', w: '#ffffff', d: '#8b86c9' }, 3, 2),
+    ],
+  },
+];
+
+// ============================================================
+// 4. Persistence
+// ============================================================
+function load(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } }
+function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+const SPEEDS = [0.5, 1, 1.5];
+const settings = Object.assign({ jump: 'dino', sound: true, music: true, speed: 1 }, load('fairyDelivery.settings', {}));
+if (!SPEEDS.includes(settings.speed)) settings.speed = 1;
+let hi = load('fairyDelivery.hi', 0) | 0;
+
+// ============================================================
+// 5. Audio (Web Audio, no files)
+// ============================================================
+let actx = null;
+function ensureAudio() {
+  if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  if (actx && actx.state === 'suspended') actx.resume();
+}
+function tone(f1, f2, dur, type = 'triangle', vol = 0.12, delay = 0) {
+  if (!settings.sound || !actx) return;
+  const t = actx.currentTime + delay;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f1, t);
+  if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(actx.destination);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+const SFX = {
+  move:      () => tone(660, 0, 0.06, 'triangle', 0.07),
+  select:    () => { tone(784, 0, 0.08); tone(1175, 0, 0.14, 'triangle', 0.12, 0.07); },
+  jump:      () => tone(520, 880, 0.12, 'sine', 0.13),
+  flutter:   () => tone(900, 1500, 0.1, 'triangle', 0.1),
+  hit:       () => { tone(330, 110, 0.3, 'square', 0.06); tone(220, 90, 0.35, 'triangle', 0.1, 0.02); },
+  deliver:   () => [523, 659, 784, 1047].forEach((f, i) => tone(f, 0, 0.2, 'triangle', 0.12, i * 0.1)),
+  victory:   () => [523, 659, 784, 1047, 784, 1047, 1319].forEach((f, i) => tone(f, 0, 0.25, 'triangle', 0.12, i * 0.12)),
+  milestone: () => { tone(1047, 0, 0.08, 'sine', 0.07); tone(1568, 0, 0.14, 'sine', 0.07, 0.08); },
+};
+
+// ============================================================
+// 5b. Music: a tiny chiptune sequencer
+// ============================================================
+// Tracks are "NOTE:steps" tokens (16 steps per bar, 4 bars per loop); "r" is a rest.
+// Drums are one 16-step bar: k = kick, s = snare, h = hi-hat, . = nothing.
+const SONG_DATA = {
+  menu: { // gentle title theme, G major
+    bpm: 112,
+    lead: `G5:4 D5:2 B4:2 D5:4 G5:4   A5:4 F#5:2 D5:2 E5:4 D5:4
+           B5:4 A5:2 G5:2 E5:4 D5:4   C5:2 E5:2 A5:2 F#5:2 G5:6 r:2`,
+    bass: `G2:8 D3:8  D3:8 A2:8  E3:8 B2:8  C3:4 D3:4 G2:8`,
+    drums: 'h...h...h...h...',
+  },
+  lvl0: { // Mossy Meadow: bouncy, C major
+    bpm: 150,
+    lead: `E5:2 G5:2 C6:2 G5:2 A5:2 G5:2 E5:4   F5:2 A5:2 G5:2 E5:2 D5:4 r:4
+           E5:2 G5:2 C6:2 D6:2 E6:2 D6:2 C6:4   A5:2 B5:2 C6:2 G5:2 C6:6 r:2`,
+    bass: `C3:2 G3:2 C4:2 G3:2 C3:2 G3:2 C4:2 G3:2   F2:2 C3:2 F3:2 C3:2 G2:2 D3:2 G3:2 D3:2
+           C3:2 G3:2 C4:2 G3:2 A2:2 E3:2 A3:2 E3:2   F2:2 C3:2 G2:2 D3:2 C3:4 G2:4`,
+    drums: 'k.h.s.h.k.h.s.hh',
+  },
+  lvl1: { // Honey Garden: skippy, F major
+    bpm: 132,
+    lead: `C5:3 D5:1 F5:2 A5:2 G5:2 F5:2 D5:4   C5:3 D5:1 F5:2 A5:2 C6:4 A5:4
+           Bb5:2 A5:2 G5:2 F5:2 G5:2 A5:2 F5:2 D5:2   C5:2 F5:2 E5:2 G5:2 F5:6 r:2`,
+    bass: `F2:4 C3:4 F2:4 C3:4  F2:4 C3:4 D3:4 A2:4  Bb2:4 F3:4 C3:4 G2:4  C3:4 C3:4 F2:8`,
+    drums: 'k...h.k.s...h...',
+  },
+  lvl2: { // Twilight Glade: dreamy arpeggios, A minor
+    bpm: 124,
+    lead: `A4:2 C5:2 E5:2 A5:2 G5:2 E5:2 C5:2 E5:2   F4:2 A4:2 C5:2 F5:2 E5:4 D5:4
+           C5:2 E5:2 G5:2 C6:2 B5:2 G5:2 E5:2 D5:2   E5:2 G#5:2 B5:2 E6:2 D6:2 B5:2 G#5:4`,
+    bass: `A2:8 E3:8  F2:8 G2:8  C3:8 G2:8  E2:8 E3:8`,
+    drums: 'k...h...s...h..h',
+  },
+};
+const NOTE_IDX = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+function noteFreq(n) {
+  const m = /^([A-G])([#b]?)(\d)$/.exec(n);
+  const midi = NOTE_IDX[m[1]] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0) + (+m[3] + 1) * 12;
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+function parseTrack(str, steps) {
+  const at = Array.from({ length: steps }, () => []);
+  let step = 0;
+  for (const tok of str.trim().split(/\s+/)) {
+    const [n, len] = tok.split(':');
+    if (n !== 'r') at[step].push({ f: noteFreq(n), len: +len });
+    step += +len;
+  }
+  if (step !== steps) console.warn('Track length', step, 'expected', steps, str);
+  return at;
+}
+const SONGS = {};
+for (const [k, d] of Object.entries(SONG_DATA)) {
+  SONGS[k] = { bpm: d.bpm, steps: 64, lead: parseTrack(d.lead, 64), bass: parseTrack(d.bass, 64), drums: d.drums };
+}
+const MUSIC_TEMPO = { 0.5: 0.85, 1: 1, 1.5: 1.15 };   // music nudges with the speed setting
+const music = { song: null, step: 0, next: 0, out: null, pulse: null, noise: null };
+
+function musicSetup() {
+  music.out = actx.createGain();
+  music.out.gain.value = 0;
+  music.out.connect(actx.destination);
+  // 25% pulse wave: the classic NES lead sound
+  const N = 32, real = new Float32Array(N), imag = new Float32Array(N);
+  for (let n = 1; n < N; n++) real[n] = (2 / (n * Math.PI)) * Math.sin(n * Math.PI * 0.25);
+  music.pulse = actx.createPeriodicWave(real, imag);
+  music.noise = actx.createBuffer(1, actx.sampleRate, actx.sampleRate);
+  const data = music.noise.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+}
+function mVoice(f, t, dur, vol, wave, type) {
+  const o = actx.createOscillator(), g = actx.createGain();
+  if (wave) o.setPeriodicWave(wave); else o.type = type;
+  o.frequency.setValueAtTime(f, t);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.005);
+  g.gain.exponentialRampToValueAtTime(vol * 0.6, t + Math.min(dur * 0.5, 0.08));
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(music.out);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+function mNoise(t, dur, vol, hp) {
+  const src = actx.createBufferSource(), f = actx.createBiquadFilter(), g = actx.createGain();
+  src.buffer = music.noise; f.type = 'highpass'; f.frequency.value = hp;
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(f).connect(g).connect(music.out);
+  src.start(t, Math.random() * 0.5); src.stop(t + dur + 0.02);
+}
+function mKick(t) {
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.frequency.setValueAtTime(150, t);
+  o.frequency.exponentialRampToValueAtTime(45, t + 0.12);
+  g.gain.setValueAtTime(0.35, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+  o.connect(g).connect(music.out);
+  o.start(t); o.stop(t + 0.16);
+}
+function wantedSong() {
+  if (!settings.music) return null;
+  if (state === 'menu' || state === 'settings') return 'menu';
+  if (state === 'playing') return 'lvl' + levelIdx;
+  return null;   // quiet for game over, delivery and victory so their jingles shine
+}
+function musicTick() {
+  if (!actx) return;
+  if (!music.out) musicSetup();
+  const now = actx.currentTime;
+  const want = wantedSong();
+  if (want !== music.song) {
+    music.song = want;
+    music.step = 0;
+    music.next = now + 0.05;
+    music.out.gain.cancelScheduledValues(now);
+    if (want) music.out.gain.setValueAtTime(0.55, music.next);
+    else music.out.gain.setTargetAtTime(0, now, 0.04);
+  }
+  if (!music.song) return;
+  if (music.next < now - 0.2) music.next = now + 0.02;   // tab was paused: don't cram missed notes
+  const s = SONGS[music.song];
+  const tempo = state === 'playing' ? MUSIC_TEMPO[settings.speed] : 1;
+  const stepDur = 60 / (s.bpm * tempo) / 4;
+  while (music.next < now + 0.15) {
+    const i = music.step % s.steps, t = music.next;
+    for (const e of s.lead[i]) {
+      mVoice(e.f, t, e.len * stepDur * 0.9, 0.05, music.pulse);
+      mVoice(e.f, t + stepDur * 3, e.len * stepDur * 0.8, 0.015, music.pulse);   // chiptune echo
+    }
+    for (const e of s.bass[i]) mVoice(e.f, t, e.len * stepDur * 0.85, 0.12, null, 'triangle');
+    const d = s.drums[i % s.drums.length];
+    if (d === 'k') mKick(t);
+    else if (d === 's') mNoise(t, 0.12, 0.12, 1200);
+    else if (d === 'h') mNoise(t, 0.03, 0.05, 7000);
+    music.next += stepDur;
+    music.step++;
+  }
+}
+
+// ============================================================
+// 6. Game state
+// ============================================================
+let state = 'menu', stateT = 0, T = 0;
+let mode = 'normal', levelIdx = 0;
+let menuIdx = 0, setIdx = 0;
+let distance = 0, score = 0, lastMilestone = 0, newHi = false, hitName = '';
+let spawnIn = 0, bufferT = 0, banner = 0, trailT = 0, worldSpeed = 0;
+let obstacles = [], particles = [];
+let fairyX = FAIRY_X;
+const fairy = { alt: 0, vy: 0, onGround: true, holdT: 0, boosting: false, flutterUsed: false };
+let complete = null;
+let goal = LEVEL_DIST;
+
+function setState(s) { state = s; stateT = 0; }
+function resetFairy() { Object.assign(fairy, { alt: 0, vy: 0, onGround: true, holdT: 0, boosting: false, flutterUsed: false }); fairyX = FAIRY_X; }
+
+function startLevel(i) {
+  // Slower speeds get shorter levels so a level takes the same real time (~37 s).
+  goal = LEVEL_DIST * Math.min(1, settings.speed);
+  levelIdx = i; distance = 0; score = 0; lastMilestone = 0; newHi = false;
+  obstacles = []; particles = []; spawnIn = 700; bufferT = 0; banner = 2.2;
+  resetFairy(); initDecor();
+  setState('playing');
+}
+function startNormal() { mode = 'normal'; startLevel(0); }
+function startEndless() { mode = 'endless'; startLevel(Math.floor(Math.random() * LEVELS.length)); }
+function nextLevel() {
+  if (levelIdx < LEVELS.length - 1) startLevel(levelIdx + 1);
+  else { setState('victory'); SFX.victory(); }
+}
+function toMenu() { obstacles = []; resetFairy(); menuIdx = 0; setState('menu'); }
+
+// ============================================================
+// 7. Input: Space only
+// ============================================================
+const press = { down: false, start: 0, stateAt: null, holdFired: false };
+function acceptsInput() {
+  if (state === 'gameOver' || state === 'victory') return stateT > 0.5;
+  if (state === 'levelComplete') return complete && complete.phase === 'done';
+  return true;
+}
+addEventListener('keydown', e => {
+  if (e.code !== 'Space') return;
+  e.preventDefault();
+  if (e.repeat) return;
+  ensureAudio();
+  press.down = true; press.start = performance.now(); press.holdFired = false;
+  press.stateAt = acceptsInput() ? state : null;
+  if (state === 'playing') jumpPressed();
+});
+addEventListener('keyup', e => {
+  if (e.code !== 'Space') return;
+  e.preventDefault();
+  if (!press.down) return;
+  press.down = false;
+  fairy.boosting = false;
+  if (press.stateAt !== state || press.holdFired || state === 'playing') return;
+  if ((performance.now() - press.start) / 1000 >= HOLD_TIME) { press.holdFired = true; onHold(); }
+  else onTap();
+});
+addEventListener('blur', () => { press.down = false; fairy.boosting = false; });
+
+function checkHold() {
+  if (press.down && !press.holdFired && press.stateAt === state && state !== 'playing'
+      && (performance.now() - press.start) / 1000 >= HOLD_TIME) {
+    press.holdFired = true; onHold();
+  }
+}
+function holdProgress() {
+  if (!press.down || press.holdFired || press.stateAt !== state) return 0;
+  const t = (performance.now() - press.start) / 1000;
+  return Math.max(0, Math.min(1, (t - 0.12) / (HOLD_TIME - 0.12)));
+}
+
+function onTap() {
+  switch (state) {
+    case 'menu': menuIdx = (menuIdx + 1) % 3; SFX.move(); break;
+    case 'settings': setIdx = (setIdx + 1) % 5; SFX.move(); break;
+    case 'gameOver': SFX.select(); mode === 'normal' ? startLevel(levelIdx) : startEndless(); break;
+    case 'levelComplete': SFX.select(); nextLevel(); break;
+    case 'victory': SFX.select(); toMenu(); break;
+  }
+}
+function onHold() {
+  switch (state) {
+    case 'menu':
+      SFX.select();
+      if (menuIdx === 0) startNormal();
+      else if (menuIdx === 1) startEndless();
+      else { setIdx = 0; setState('settings'); }
+      break;
+    case 'settings':
+      if (setIdx === 0) settings.jump = settings.jump === 'dino' ? 'double' : 'dino';
+      else if (setIdx === 1) settings.speed = SPEEDS[(SPEEDS.indexOf(settings.speed) + 1) % SPEEDS.length];
+      else if (setIdx === 2) settings.sound = !settings.sound;
+      else if (setIdx === 3) settings.music = !settings.music;
+      else { menuIdx = 2; setState('menu'); }
+      save('fairyDelivery.settings', settings);
+      SFX.select();
+      break;
+    case 'gameOver': case 'levelComplete': case 'victory':
+      SFX.select(); toMenu(); break;
+  }
+}
+
+function doJump() {
+  fairy.vy = JUMP_V; fairy.onGround = false; fairy.holdT = 0;
+  fairy.boosting = settings.jump === 'dino' && press.down;
+  fairy.flutterUsed = false;
+  SFX.jump();
+  const top = fairyTop();
+  for (let i = 0; i < 6; i++) spark(fairyX + 14 + Math.random() * 12, top + FH - 2, -80 - Math.random() * 120, -Math.random() * 60, 0.4, SPARK[i % 4], 2);
+}
+function jumpPressed() {
+  if (fairy.onGround) doJump();
+  else if (settings.jump === 'double' && !fairy.flutterUsed) {
+    fairy.vy = FLUTTER_V; fairy.flutterUsed = true;
+    SFX.flutter();
+    const top = fairyTop();
+    for (let i = 0; i < 10; i++) {
+      const a = Math.random() * Math.PI * 2;
+      spark(fairyX + 8, top + 12, Math.cos(a) * 90 - 60, Math.sin(a) * 90, 0.45, SPARK[i % 4], 2);
+    }
+  } else bufferT = JUMP_BUFFER;
+}
+
+// ============================================================
+// 8. Update
+// ============================================================
+function fairyTop() { return GROUND_Y - FH + 1 - fairy.alt; }
+function overlap(a, b) { return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
+
+function spark(x, y, vx, vy, life, color, size = 2, g = 0) {
+  particles.push({ x, y, vx, vy, life, max: life, color, size, g });
+}
+
+function physics(dt) {
+  const f = fairy;
+  if (f.onGround) return;
+  let g = GRAVITY;
+  if (f.boosting && f.holdT < HOLD_MAX && f.vy > 0) g *= HOLD_GRAVITY_MULT;
+  f.holdT += dt;
+  f.vy -= g * dt;
+  f.alt += f.vy * dt;
+  if (f.alt <= 0) {
+    f.alt = 0; f.vy = 0; f.onGround = true; f.boosting = false;
+    if (state === 'playing' && bufferT > 0) { bufferT = 0; doJump(); }
+  }
+}
+
+function spawnGroup() {
+  const lv = LEVELS[levelIdx];
+  const d = lv.obs[Math.floor(Math.random() * lv.obs.length)];
+  const n = 1 + Math.floor(Math.random() * d.group);
+  let x = W + 10;
+  for (let i = 0; i < n; i++) {
+    obstacles.push({ name: d.name, s: d.spr, x, y: GROUND_Y - d.spr.h + 2, w: d.spr.w, h: d.spr.h, sc: d.scale });
+    x += d.spr.w + 3;
+  }
+  spawnIn = (x - W) + MIN_GAP + Math.random() * (MAX_GAP - MIN_GAP);
+}
+
+function trail(dt) {
+  trailT += dt;
+  if (trailT < 0.035) return;
+  trailT = 0;
+  const top = fairyTop();
+  spark(fairyX + 4, top + 16 + Math.random() * 12, -worldSpeed * 0.6 - 30 - Math.random() * 30,
+        (Math.random() - 0.5) * 30, 0.55, SPARK[Math.floor(Math.random() * 4)], 2);
+}
+
+function die(o) {
+  SFX.hit();
+  hitName = o.name;
+  newHi = false;
+  if (mode === 'endless' && score > hi) { hi = score; newHi = true; save('fairyDelivery.hi', hi); }
+  const top = fairyTop();
+  for (let i = 0; i < 16; i++) {
+    const a = Math.random() * Math.PI * 2;
+    spark(fairyX + 20, top + 20, Math.cos(a) * 140, Math.sin(a) * 140, 0.6, SPARK[i % 4], 3, 200);
+  }
+  setState('gameOver');
+}
+
+function updatePlaying(dt) {
+  distance += SPEED * dt;
+  bufferT -= dt;
+  banner -= dt;
+  physics(dt);
+
+  spawnIn -= SPEED * dt;
+  if (spawnIn <= 0) {
+    const ok = mode === 'endless' || distance + W + 80 < goal + FAIRY_X - 150;
+    if (ok) spawnGroup(); else spawnIn = Infinity;
+  }
+  for (const o of obstacles) o.x -= SPEED * dt;
+  obstacles = obstacles.filter(o => o.x + o.w > -20);
+
+  trail(dt);
+
+  const top = fairyTop();
+  const fb = { x: fairyX + 10, y: top + 4, w: 20, h: FH - 6 };
+  for (const o of obstacles) {
+    if (overlap(fb, { x: o.x + o.sc, y: o.y + o.sc, w: o.w - 2 * o.sc, h: o.h - o.sc })) { die(o); return; }
+  }
+
+  if (mode === 'endless') {
+    score = Math.floor(distance / SCORE_DIV);
+    const m = Math.floor(score / 100);
+    if (m > lastMilestone) { lastMilestone = m; SFX.milestone(); }
+  } else if (distance >= goal) {
+    distance = goal;
+    complete = { phase: 'walk', t: 0, burst: false };
+    setState('levelComplete');
+  }
+}
+
+function updateComplete(dt) {
+  physics(dt);
+  const c = complete;
+  c.t += dt;
+  if (c.phase === 'walk') {
+    const target = VILLAGE_X + 10;
+    fairyX = Math.min(target, fairyX + 230 * dt);
+    trail(dt);
+    if (fairyX >= target && fairy.onGround) { c.phase = 'deliver'; c.t = 0; SFX.deliver(); }
+  } else if (c.phase === 'deliver') {
+    if (c.t >= 0.6 && !c.burst) {
+      c.burst = true;
+      for (let i = 0; i < 24; i++) {
+        const a = Math.random() * Math.PI * 2, s = 60 + Math.random() * 120;
+        spark(VILLAGE_X + 40, GROUND_Y - 22, Math.cos(a) * s, Math.sin(a) * s - 40, 0.9, SPARK[i % 4], 3, 120);
+      }
+    }
+    if (c.t >= 1.1) { c.phase = 'done'; c.t = 0; }
+  }
+}
+
+function update(realDt) {
+  checkHold();
+  musicTick();
+  // Speed setting slows or speeds the whole game clock, so jumps stay the same shape relative to obstacles.
+  const inGame = state !== 'menu' && state !== 'settings';
+  const dt = inGame ? realDt * settings.speed : realDt;
+  stateT += realDt;
+  worldSpeed = state === 'playing' ? SPEED : (state === 'menu' || state === 'settings') ? 90 : 0;
+  updateDecor(dt);
+
+  if (state === 'playing') updatePlaying(dt);
+  else if (state === 'levelComplete') updateComplete(dt);
+  else if (state === 'gameOver') physics(dt);
+  else if (state === 'victory' && Math.random() < 0.5) {
+    const colors = ['#f59fc4', '#ffc86b', '#a8e6ff', '#c3a6f2', '#8fd6b4'];
+    spark(Math.random() * W, -4, (Math.random() - 0.5) * 40, 40 + Math.random() * 40, 3.5, colors[Math.floor(Math.random() * 5)], 3, 10);
+  }
+
+  for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += p.g * dt; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+}
+
+// ---- Decor (parallax scenery) ----
+let clouds = [], specks = [], stars = [], petals = [], fireflies = [], hillOff = 0;
+const rand = (a, b) => a + Math.random() * (b - a);
+function initDecor() {
+  clouds = Array.from({ length: 4 }, (_, i) => ({ x: i * 220 + rand(0, 120), y: rand(26, 110), f: rand(0.1, 0.18) }));
+  specks = Array.from({ length: 50 }, () => ({ x: rand(0, W), y: GROUND_Y + rand(4, 20), w: 1 + Math.floor(rand(0, 3)) }));
+  stars = Array.from({ length: 45 }, () => ({ x: rand(0, W), y: rand(8, 150), p: rand(0, 6), s: Math.random() < 0.3 ? 2 : 1 }));
+  petals = Array.from({ length: 14 }, () => ({ x: rand(0, W), y: rand(20, 200), p: rand(0, 6) }));
+  fireflies = Array.from({ length: 12 }, () => ({ x: rand(0, W), y: rand(100, 200), p: rand(0, 6) }));
+}
+function updateDecor(dt) {
+  const s = worldSpeed;
+  hillOff += s * 0.08 * dt;
+  for (const c of clouds) { c.x -= (s * c.f + 6) * dt; if (c.x < -60) { c.x = W + rand(0, 100); c.y = rand(26, 110); } }
+  for (const p of specks) { p.x -= s * dt; if (p.x < -4) { p.x = W + rand(0, 20); p.y = GROUND_Y + rand(4, 20); } }
+  for (const st of stars) { st.x -= s * 0.02 * dt; if (st.x < -2) st.x = W + 2; }
+  for (const p of petals) { p.x -= (s * 0.35 + 20) * dt; p.y += Math.sin(T * 2 + p.p) * 20 * dt + 8 * dt; if (p.x < -6 || p.y > GROUND_Y) { p.x = W + rand(0, 60); p.y = rand(10, 120); } }
+  for (const f of fireflies) { f.x -= (s * 0.25 + 10) * dt; if (f.x < -6) { f.x = W + rand(0, 60); f.y = rand(100, 200); } }
+}
+
+// ============================================================
+// 9. Render
+// ============================================================
+function rr(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function txt(s, x, y, size, color, align = 'center') {
+  ctx.font = `${size}px 'Press Start 2P', monospace`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.fillStyle = color;
+  ctx.fillText(s, x, y);
+}
+function shadowTxt(s, x, y, size, color, shadow) {
+  txt(s, x + 2, y + 2, size, shadow);
+  txt(s, x, y, size, color);
+}
+function panel(cx, cy, w, h) {
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  rr(cx - w / 2, cy - h / 2, w, h, 12); ctx.fill();
+  ctx.strokeStyle = '#ecd2ea'; ctx.lineWidth = 2; ctx.stroke();
+}
+function holdHint(cx, y, tapText, holdText) {
+  txt(`TAP SPACE: ${tapText}    HOLD SPACE: ${holdText}`, cx, y, 7, UI_SOFT);
+  const p = holdProgress();
+  if (p > 0) {
+    ctx.fillStyle = 'rgba(217,156,195,0.25)'; rr(cx - 80, y + 9, 160, 5, 2.5); ctx.fill();
+    ctx.fillStyle = UI_STROKE; rr(cx - 80, y + 9, 160 * p, 5, 2.5); ctx.fill();
+  }
+}
+function drawSparkle(x, y, s, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(Math.round(x - s), Math.round(y), s * 2 + 1, 1);
+  ctx.fillRect(Math.round(x), Math.round(y - s), 1, s * 2 + 1);
+}
+
+function drawScene() {
+  const lv = LEVELS[levelIdx];
+  const g = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+  g.addColorStop(0, lv.sky[0]); g.addColorStop(1, lv.sky[1]);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, GROUND_Y);
+
+  if (lv.decor.stars) for (const st of stars) {
+    ctx.globalAlpha = 0.5 + 0.5 * Math.sin(T * 2 + st.p);
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(Math.round(st.x), Math.round(st.y), st.s, st.s);
+  }
+  ctx.globalAlpha = 1;
+  if (lv.decor.moon) {
+    ctx.fillStyle = 'rgba(255,248,220,0.35)'; ctx.beginPath(); ctx.arc(700, 50, 28, 0, 7); ctx.fill();
+    ctx.fillStyle = '#fff6d8'; ctx.beginPath(); ctx.arc(700, 50, 18, 0, 7); ctx.fill();
+    ctx.fillStyle = '#f1e4c0'; ctx.fillRect(694, 44, 5, 5); ctx.fillRect(704, 54, 4, 4);
+  }
+  if (lv.decor.sun) {
+    ctx.fillStyle = 'rgba(255,236,160,0.4)'; ctx.beginPath(); ctx.arc(690, 48, 30, 0, 7); ctx.fill();
+    ctx.fillStyle = '#fff1b0'; ctx.beginPath(); ctx.arc(690, 48, 20, 0, 7); ctx.fill();
+  }
+  if (lv.decor.clouds) {
+    ctx.globalAlpha = 0.85;
+    for (const c of clouds) draw(CLOUD, c.x, c.y);
+    ctx.globalAlpha = 1;
+  }
+
+  // rolling hills (stepped for a pixel feel)
+  ctx.fillStyle = lv.hill;
+  for (let x = 0; x < W; x += 4) {
+    const h = 22 + 12 * Math.sin((x + hillOff) / 90) + 7 * Math.sin((x + hillOff) / 37);
+    ctx.fillRect(x, Math.round(GROUND_Y - h), 4, Math.round(h));
+  }
+
+  // ground
+  ctx.fillStyle = lv.fill; ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+  ctx.fillStyle = lv.ground; ctx.fillRect(0, GROUND_Y, W, 2);
+  ctx.fillStyle = lv.speck;
+  for (const p of specks) ctx.fillRect(Math.round(p.x), Math.round(p.y), p.w, 1);
+}
+
+function drawVillage(x) {
+  const lv = LEVELS[levelIdx];
+  // string lights
+  for (let i = 0; i <= 14; i++) {
+    const t = i / 14;
+    const lx = x + 28 + t * 112, ly = GROUND_Y - 58 + Math.sin(t * Math.PI) * 14;
+    ctx.globalAlpha = 0.6 + 0.4 * Math.sin(T * 4 + i);
+    ctx.fillStyle = SPARK[i % 4]; ctx.fillRect(Math.round(lx), Math.round(ly), 3, 3);
+  }
+  ctx.globalAlpha = 1;
+  draw(HOUSE_S2, x + 118, GROUND_Y - HOUSE_S2.h + 2);
+  draw(HOUSE_S1, x + 66, GROUND_Y - HOUSE_S1.h + 2);
+  draw(HOUSE_BIG, x, GROUND_Y - HOUSE_BIG.h + 2);
+  txt('FAIRY VILLAGE', x + 80, GROUND_Y - 84, 8, lv.hud === '#ffffff' ? '#ffffff' : UI);
+}
+
+function drawFairy(x, top, item) {
+  const fast = !fairy.onGround || state === 'menu' || state === 'settings';
+  const frame = Math.floor(T / (fast ? 0.07 : 0.14)) % 2;
+  draw(FAIRY[frame], x, top);
+  if (item) draw(item, x + 30, top + 15);
+}
+
+function drawHUD() {
+  const lv = LEVELS[levelIdx];
+  if (mode === 'endless') {
+    const pad = n => String(n).padStart(5, '0');
+    txt(`HI ${pad(hi)}  ${pad(score)}`, W - 20, 24, 12, lv.hud, 'right');
+    txt(lv.name.toUpperCase(), 20, 24, 8, lv.hud, 'left');
+  } else {
+    txt(`LV ${levelIdx + 1}  ${lv.item.toUpperCase()}`, 20, 24, 10, lv.hud, 'left');
+    const x0 = 560, bw = 190, p = Math.min(1, distance / goal);
+    ctx.fillStyle = 'rgba(255,255,255,0.6)'; rr(x0, 20, bw, 8, 4); ctx.fill();
+    ctx.fillStyle = lv.ground; rr(x0, 20, Math.max(8, bw * p), 8, 4); ctx.fill();
+    draw(HOUSE_TINY, x0 + bw + 8, 17);
+    drawSparkle(x0 + bw * p, 24, 4, '#ffffff');
+  }
+}
+
+function drawOptions(opts, sel, y0, gap, h = 26) {
+  const cx = W / 2 + 60;
+  opts.forEach((o, i) => {
+    const y = y0 + i * gap, w = 250, x = cx - w / 2;
+    const on = i === sel;
+    ctx.fillStyle = on ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.5)';
+    rr(x, y - h / 2, w, h, 9); ctx.fill();
+    if (on) {
+      const p = holdProgress();
+      if (p > 0) { ctx.fillStyle = UI_ACCENT; rr(x, y - h / 2, w * p, h, 9); ctx.fill(); }
+      ctx.strokeStyle = UI_STROKE; ctx.lineWidth = 2; rr(x, y - h / 2, w, h, 9); ctx.stroke();
+      drawSparkle(x - 14, y, 4 + Math.round(Math.sin(T * 6)), UI_STROKE);
+    }
+    txt(o, cx, y + 1, 10, on ? UI : UI_SOFT);
+  });
+}
+
+function drawMenuFairy() {
+  fairy.onGround = true;
+  drawFairy(150, 96 + Math.sin(T * 2.5) * 6, null);
+  if (Math.random() < 0.3) spark(150, 120 + Math.sin(T * 2.5) * 6, -60 - Math.random() * 40, (Math.random() - 0.5) * 20, 0.6, SPARK[Math.floor(Math.random() * 4)], 2);
+}
+
+function render() {
+  const lv = LEVELS[levelIdx];
+  drawScene();
+
+  const showVillage = state === 'victory' || (mode === 'normal' && (state === 'playing' || state === 'levelComplete' || state === 'gameOver'));
+  if (showVillage) {
+    const vx = VILLAGE_X + (goal - distance);
+    if (vx < W + 10) drawVillage(vx);
+  }
+
+  for (const o of obstacles) draw(o.s, o.x, o.y);
+
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(Math.round(p.x), Math.round(p.y), p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+
+  if (state === 'menu' || state === 'settings') drawMenuFairy();
+  else {
+    const bob = fairy.onGround && state === 'playing' ? Math.round(Math.sin(T * 9) * 1.2) : 0;
+    const top = fairyTop() + bob;
+    let item = lv.items.hand;
+    if (state === 'levelComplete' && complete.phase !== 'walk') item = null;
+    if (state === 'victory') item = null;
+    drawFairy(fairyX, top, item);
+
+    if (state === 'levelComplete' && complete.phase === 'deliver' && complete.t < 0.6) {
+      const k = complete.t / 0.6;
+      const sx = fairyX + 30, sy = top + 15, tx = VILLAGE_X + 34, ty = GROUND_Y - 28;
+      ctx.globalAlpha = 1 - k * 0.6;
+      draw(lv.items.hand, sx + (tx - sx) * k, sy + (ty - sy) * k - Math.sin(k * Math.PI) * 30);
+      ctx.globalAlpha = 1;
+    }
+    if (state === 'gameOver') {
+      for (let i = 0; i < 3; i++) {
+        const a = T * 4 + i * 2.1;
+        drawSparkle(fairyX + 24 + Math.cos(a) * 12, top - 4 + Math.sin(a) * 4, 3, '#ffd36b');
+      }
+    }
+  }
+
+  // foreground decor
+  if (lv.decor.petals) for (const p of petals) {
+    ctx.fillStyle = '#ffc2dc'; ctx.fillRect(Math.round(p.x), Math.round(p.y), 3, 2);
+  }
+  if (lv.decor.fireflies) for (const f of fireflies) {
+    const y = f.y + Math.sin(T * 1.5 + f.p) * 8;
+    ctx.globalAlpha = 0.25 + 0.2 * Math.sin(T * 3 + f.p);
+    ctx.fillStyle = '#fff6a8'; ctx.fillRect(Math.round(f.x) - 3, Math.round(y) - 3, 8, 8);
+    ctx.globalAlpha = 1;
+    ctx.fillRect(Math.round(f.x), Math.round(y), 2, 2);
+  }
+
+  if (state === 'menu') renderMenu();
+  else if (state === 'settings') renderSettings();
+  else if (state === 'victory') renderVictory();
+  else {
+    drawHUD();
+    if (state === 'playing' && banner > 0) renderBanner(lv);
+    if (state === 'gameOver') renderGameOver(lv);
+    if (state === 'levelComplete' && complete.phase === 'done') renderDelivered(lv);
+  }
+}
+
+function renderMenu() {
+  shadowTxt('FAIRY DELIVERY', W / 2, 46, 22, UI, UI_ACCENT);
+  txt('Carry treasures home to the fairy village', W / 2, 74, 8, UI_SOFT);
+  drawOptions(['NORMAL', 'ENDLESS', 'SETTINGS'], menuIdx, 108, 32);
+  const desc = [
+    'Deliver 3 treasures, one per level',
+    `Run forever for a high score  -  HI ${hi}`,
+    `Jump: ${settings.jump === 'dino' ? 'Dino' : 'Double'}  -  Speed: ${settings.speed}x  -  Sound: ${settings.sound ? 'On' : 'Off'}  -  Music: ${settings.music ? 'On' : 'Off'}`,
+  ][menuIdx];
+  txt(desc, W / 2 + 60, 194, 7, UI_SOFT);
+  txt('TAP SPACE: NEXT    HOLD SPACE: SELECT', W / 2, 238, 7, UI_SOFT);
+}
+
+function renderSettings() {
+  shadowTxt('SETTINGS', W / 2, 46, 20, UI, UI_ACCENT);
+  drawOptions([
+    `JUMP: ${settings.jump === 'dino' ? 'DINO' : 'DOUBLE'}`,
+    `SPEED: ${settings.speed}X`,
+    `SOUND: ${settings.sound ? 'ON' : 'OFF'}`,
+    `MUSIC: ${settings.music ? 'ON' : 'OFF'}`,
+    'BACK',
+  ], setIdx, 80, 25, 22);
+  const desc = [
+    settings.jump === 'dino' ? 'Dino: hold SPACE longer to jump higher' : 'Double: press SPACE again mid-air to flutter',
+    { 0.5: 'Slow and gentle - great for little fairies', 1: 'Normal speed', 1.5: 'Zippy! For speedy fairies' }[settings.speed],
+    'Chimes and sparkly sounds',
+    'Bouncy 8-bit tunes, one for each level',
+    'Return to the title screen',
+  ][setIdx];
+  txt(desc, W / 2 + 60, 202, 7, UI_SOFT);
+  txt('TAP SPACE: NEXT    HOLD SPACE: CHANGE', W / 2, 238, 7, UI_SOFT);
+}
+
+function renderBanner(lv) {
+  ctx.globalAlpha = Math.min(1, banner / 0.5);
+  const title = mode === 'normal' ? `LEVEL ${levelIdx + 1}: THE ${lv.item.toUpperCase()}` : `ENDLESS  -  ${lv.name.toUpperCase()}`;
+  const sub = mode === 'normal' ? 'Bring it home to the fairy village!' : 'How far can you fly?';
+  panel(W / 2, 82, 420, 58);
+  txt(title, W / 2, 72, 12, UI);
+  txt(sub, W / 2, 94, 8, UI_SOFT);
+  ctx.globalAlpha = 1;
+}
+
+function renderGameOver(lv) {
+  panel(W / 2, 92, 440, 96);
+  if (mode === 'normal') {
+    txt(`OOPS! YOU BUMPED ${hitName.toUpperCase()}`, W / 2, 66, 10, UI);
+    txt(`The ${lv.item.toLowerCase()} is safe. Try again!`, W / 2, 88, 8, UI_SOFT);
+    if (stateT > 0.5) holdHint(W / 2, 116, 'RETRY', 'MENU');
+  } else {
+    txt('GAME OVER', W / 2, 62, 14, UI);
+    txt(`SCORE ${score}${newHi ? '   NEW HIGH SCORE!' : `   HI ${hi}`}`, W / 2, 88, 8, newHi ? UI_STROKE : UI_SOFT);
+    if (stateT > 0.5) holdHint(W / 2, 116, 'RUN AGAIN', 'MENU');
+  }
+}
+
+function renderDelivered(lv) {
+  const cx = W / 2 + 120;
+  panel(cx, 82, 400, 76);
+  shadowTxt('DELIVERED!', cx, 62, 14, UI, UI_ACCENT);
+  txt(`The ${lv.item.toLowerCase()} made it home.`, cx, 84, 8, UI_SOFT);
+  holdHint(cx, 104, levelIdx < LEVELS.length - 1 ? 'NEXT LEVEL' : 'CELEBRATE', 'MENU');
+}
+
+function renderVictory() {
+  const colorsY = GROUND_Y - 84;
+  const spots = [VILLAGE_X + 28, VILLAGE_X + 87, VILLAGE_X + 139];
+  LEVELS.forEach((l, i) => {
+    const y = colorsY - 10 + Math.sin(T * 2 + i) * 4;
+    draw(l.items.big, spots[i] - 9, y - 20);
+    drawSparkle(spots[i] + 12, y - 22, 2 + Math.round(Math.sin(T * 5 + i)), '#ffffff');
+  });
+  shadowTxt('ALL DELIVERIES COMPLETE!', W / 2, 36, 16, UI, UI_ACCENT);
+  txt('The fairy village thanks you, little fairy.', W / 2, 62, 8, UI);
+  if (stateT > 0.5) txt('TAP OR HOLD SPACE: MENU', W / 2, 238, 7, UI_SOFT);
+}
+
+// ============================================================
+// 10. Loop
+// ============================================================
+initDecor();
+let last = performance.now();
+function frame(now) {
+  const dt = Math.max(0, Math.min(0.05, (now - last) / 1000));
+  last = now;
+  T += dt;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
